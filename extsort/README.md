@@ -157,4 +157,101 @@ peak_rss ≈ 52MB（VmHWM 真实峰值；B=18MB 只计驻留字节内容）
 ```
 
 说明：在当前几何下，同步协作回收几乎总能即时解围，所以大文件测试中
-`RESERVE_WAIT` 稀少；等待/唤醒路径由屏障测试与取消测试确定性覆盖。
+`RESERVE_WAIT` 稀少；等待/唤醒/路径由屏障测试与取消测试确定性覆盖。
+
+---
+
+# 时间范围全外连接（interval-join）
+
+`extsort.interval.IntervalJoinJob` 在同一套外排内核、同一个 `BufferArbiter`
+之上实现"观测值关联有效时间段"的全外连接，使用者**不需要先排序**，直接从
+两份乱序 JSONL 得到可追溯明细。提交入口与普通排序共用一个 runner：
+
+```python
+jid = runner.submit_interval_join(left_path, right_path, output_path, ...)
+runner.status(jid)      # 同一套 status/cancel/wait，返回四阶段与各项计数
+runner.cancel(jid); runner.wait(jid)
+```
+
+CLI：
+
+```bash
+python -m extsort.cli interval-join --left L.jsonl --right R.jsonl \
+    -o out.jsonl --budget 64MB --workdir ./work [--max-line-bytes ...]
+```
+
+## 数据合同
+
+* 左表每行：非空字符串 `text`、真有符号 64 位整数 `start`、`end`，
+  `start <= end`（`start == end` 是空区间，合法但永不命中）；
+* 右表每行：非空字符串 `text`、真有符号 64 位整数 `at`；
+* `bool`、浮点、越界整数、缺失/非字符串 `text`、空行、非法 JSON、超长行都让
+  作业失败，错误明确给出**侧别（left/right）与从 1 开始的物理行号**
+  （`IntervalInputError`），不发布半成品；
+* 相同内容的两行仍是两个不同来源行，不去重；
+* 命中条件仅为 `text 完全相同 and start <= at < end`（半开区间，不做时区转换）。
+
+## 输出合同
+
+每行 `kind/key/left_row/right_row/left/right`：`match` 保留两侧原对象与两个
+物理行号；`left_only`/`right_only` 缺侧为 `null`。顺序固定为 key 的 Unicode
+码点序；同 key 内所有带左行的记录（match、left_only）按 left_row 升序、同
+left_row 的 match 再按 right_row 升序，全部先于该 key 的 right_only（按
+right_row 升序）。因此换读块大小、溢写次数、线程交错都不改变输出。
+
+## 四阶段与磁盘组织
+
+每个阶段都在自己的 MWS 包络内准入，`status().phase` 依次为
+`organize -> join -> output_sort -> publish`，失败/取消终结，绝不发布。
+
+1. **organize（读取整理）**：逐块校验、预留后编码，按
+   `(key, start, lineno)` / `(key, at, lineno)` 溢写排序 run，再多趟 k-way
+   归并成全局有序的 `left.side` / `right.side`（定长二进制头 + key + 原始行）。
+2. **join（关联）**：两侧按键归并进入同一 key 的扫描。右观测按 `at` 升序，
+   左区间用排序游标把 `start <= at` 者装入按 `end` 排序的活跃小顶堆，
+   `end <= at` 者过期；堆字节超阈值时整体按 end 序溢成 `active-*.run`，
+   活跃 run 带持久过期 mark，后续观测只做后缀重扫，run 数到上限再 k-way 合并。
+   命中的左行序号写入分页位图 `marker-*.bit`（驻留页数有界，脏页回写），
+   每条结果（含两侧原始行）滚动写入 `result-*.run`。key 结束后按 marker 流式
+   重读左组，未标记的发 `left_only`；未命中的观测即时发 `right_only`。
+3. **output_sort（输出重排）**：result run 是扫描序而非输出序，先对每个 run
+   做有界块排序生成有序 run，再多趟 k-way 归并，保证最终来源行顺序。
+4. **publish（发布）**：渲染 JSONL 到 `output.tmp.<jid>`，`os.replace` 原子
+   替换；取消/失败只清本作业临时目录，保留输入与既有目标文件。
+
+## 候选检查口径与稀疏线性界
+
+候选检查只在两个方法计数，没有任何比较藏在辅助函数里：`_check_start`（左
+记录对某 `at` 的 start 判定）与 `_evaluate`（完整 `start <= at < end`）。
+活跃 run 后缀重扫的每次判定同样计数。对"N 个互不相交区间、每区间恰一个观测"
+的稀疏形态，每区间只承受常数次 start/过期/命中检查，
+`candidate_checks` 为 O(N)（测试断言 `<= 8N`，合同验收界为 `<= 64N`），
+而不是 N² 全组合；稠密重叠允许与命中乘积同阶，不截断不抽样。
+
+`status()` 暴露 `candidate_checks`、`active_flushes`、`active_merges`、
+`marker_pages`、`bytes_written`/`bytes_read`（含位图/索引页 I/O）及
+matches/left_only/right_only 与两侧输入数。
+
+## 内存有界性
+
+两侧原始文件、单 key 时间段组、仍活跃区间集、匹配中间结果、最终配对输出都
+可能分别大于预算 B，且全部走临时磁盘：行/键/时间索引编码页、匹配标记位图页、
+活跃区间行（kind `active`）、在途读写（`io`/`buffer`/`merge-read` 等）都先
+预留后复制，最后一个产品引用消失后才归还，逐事件满足
+`total_reserved <= budget`；Python 固定对象开销仍按既有口径单独估算。所有
+内部整理/关联预留都登记在**同一个作业 id** 下，不存在独立子作业，因此内部
+任务不会等待自己占住的额度而死锁；协作回收回调只溢写 organize 阶段已预留的
+run，回调内绝不调用 reserve。
+
+## 测试
+
+| 测试 | 内容 |
+|------|------|
+| `test_interval_correctness.py` | 手算例逐条核对来源行与顺序；40 个随机种子 × 3 种缓冲几何，对独立双重循环参考实现（`ij_ref.py`，不用生产匹配/排序函数）逐记录比对；空文件/单侧键；稀疏 `<=64N` 候选界；稠密活跃集溢盘 |
+| `test_interval_validation.py`  | 空行、非法 JSON、bool/浮点/越界整数、缺字段、空 text、start>end、超长行、迟到非法记录；侧别+行号错误、无半成品、仲裁器可复用、故障隔离 |
+| `test_interval_lifecycle.py`   | 两个确定性取消点（热点组已溢盘、配对已部分生成未发布）的 hook 闸门；注入写失败只伤本作业；与普通排序作业在同一仲裁器下并发完成；逐事件预算恒等式、额度归零 |
+| `test_interval_scale.py`       | 运行时造数：单 key 两侧组 > B 的稀疏关联、活跃集与配对乘积 > B 的稠密关联；流式顺序/来源校验、候选界、I/O 与峰值 RSS、预留事件轨迹与字节对象生命周期 |
+
+生成的大数据与输出只落在临时/`artifacts` 目录，夹具与生成器在 `tests/` 内，
+不提交大文件。
+

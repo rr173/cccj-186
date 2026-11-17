@@ -8,6 +8,7 @@ from .arbiter import BufferArbiter, ConfigError
 from .events import EventLog
 from .ioengine import IOEngine
 from .job import JobConfig, SortJob
+from .interval import IntervalConfig, IntervalJoinJob
 
 
 class JobRunner:
@@ -46,6 +47,35 @@ class JobRunner:
                          mws=job.mws, dedup_key=cfg.dedup_key,
                          max_line_bytes=cfg.max_line_bytes,
                          total_reserved=self.arbiter.total_reserved, budget=self.arbiter.budget)
+        t.start()
+        return jid
+
+    def submit_interval_join(self, left_path: str, right_path: str,
+                             output_path: str, *, job_id: str | None = None,
+                             **cfg_kwargs) -> str:
+        """Submit one external full-out interval-join job.
+
+        The returned id is managed through the same status/cancel/wait API as
+        sort jobs; the job shares this runner's BufferArbiter (all internal
+        reservations belong to this single job id, so the internal organize
+        work can never deadlock waiting for quota it owns itself).
+        """
+        with self._lock:
+            self._seq += 1
+            jid = job_id or f"job{self._seq}"
+            if jid in self._jobs:
+                raise ValueError(f"duplicate job_id {jid}")
+        cfg = IntervalConfig(left_path, right_path, output_path, **cfg_kwargs)
+        job = IntervalJoinJob(self, jid, cfg)   # MWS check: ConfigError at submit
+        t = threading.Thread(target=job.run, name=f"ijob-{jid}", daemon=True)
+        with self._lock:
+            self._jobs[jid] = job
+            self._threads[jid] = t
+        self.events.emit("JOB_SUBMIT", jid, left=left_path, right=right_path,
+                         output=output_path, mws=job.mws, job_type="interval-join",
+                         max_line_bytes=cfg.max_line_bytes,
+                         total_reserved=self.arbiter.total_reserved,
+                         budget=self.arbiter.budget)
         t.start()
         return jid
 

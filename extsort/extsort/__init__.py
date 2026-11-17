@@ -2,6 +2,8 @@
 from .arbiter import (AllocFailed, BufferArbiter, Cancelled, ConfigError,  # noqa: F401
                       Reservation)
 from .job import JobConfig, JobFailed, SortJob  # noqa: F401
+from .interval import (IntervalConfig, IntervalInputError,  # noqa: F401
+                       IntervalJoinJob)
 from .runner import JobRunner  # noqa: F401
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

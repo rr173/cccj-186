@@ -53,6 +53,21 @@ def main(argv=None) -> int:
     ver.add_argument("--dedup", action="store_true")
     ver.add_argument("--exact", action="store_true", help="in-memory sorted() comparison")
 
+    ij = sub.add_parser("interval-join",
+                        help="full outer interval join of two unordered JSONL files")
+    ij.add_argument("--left", required=True, help="left JSONL (text,start,end)")
+    ij.add_argument("--right", required=True, help="right JSONL (text,at)")
+    ij.add_argument("-o", "--output", required=True)
+    ij.add_argument("--budget", required=True, type=_size)
+    ij.add_argument("--workdir", required=True)
+    ij.add_argument("--max-line-bytes", type=_size, default=256 * 1024)
+    ij.add_argument("--read-block", type=_size, default=256 * 1024)
+    ij.add_argument("--write-buf", type=_size, default=512 * 1024)
+    ij.add_argument("--merge-chunk", type=_size, default=256 * 1024)
+    ij.add_argument("--max-fan-in", type=int, default=8)
+    ij.add_argument("--fsync", action="store_true")
+    ij.add_argument("--event-log", default=None)
+
     args = ap.parse_args(argv)
 
     if args.cmd == "run":
@@ -87,6 +102,27 @@ def main(argv=None) -> int:
             rep.pop("jobs", None)
             print("REPORT " + json.dumps(rep, ensure_ascii=False, indent=2))
             return 0 if ok else 1
+        finally:
+            runner.shutdown()
+
+    if args.cmd == "interval-join":
+        runner = JobRunner(args.budget, args.workdir,
+                           event_log_path=args.event_log, fsync=args.fsync)
+        try:
+            jid = runner.submit_interval_join(
+                args.left, args.right, args.output,
+                max_line_bytes=args.max_line_bytes,
+                read_block_bytes=args.read_block,
+                write_buf_bytes=args.write_buf,
+                merge_chunk_bytes=args.merge_chunk,
+                max_fan_in=args.max_fan_in)
+            print(f"submitted {jid}: {args.left} >< {args.right} -> {args.output}")
+            st = runner.wait(jid)
+            print(json.dumps(st, ensure_ascii=False))
+            rep = runner.report()
+            rep.pop("jobs", None)
+            print("REPORT " + json.dumps(rep, ensure_ascii=False, indent=2))
+            return 0 if st["state"] == "DONE" else 1
         finally:
             runner.shutdown()
 

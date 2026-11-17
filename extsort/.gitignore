@@ -1,0 +1,12 @@
+# Runtime-generated test/benchmark data and reports are never source.
+artifacts/
+**/work/
+**/work[0-9]*/
+*.tmp
+*.tmp.*
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Keep bounded fixtures/generators/reports under tests/ tracked; ignore the
+# large outputs the scale/large tests generate under temp dirs instead.

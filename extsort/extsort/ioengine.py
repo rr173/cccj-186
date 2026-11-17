@@ -73,9 +73,17 @@ class JobWriter:
             self._cond.notify_all()
 
     def wait_idle(self):
-        """Block until the queue is drained and no item is executing."""
+        """Block until the queue is drained and no item is executing.
+
+        Once cancelled, in-flight work is allowed to finish but the caller no
+        longer waits for the full queue: a cancelled job unwinds immediately,
+        and the writer thread drains/discards the rest on its own.  The final
+        ``join()`` in the job's teardown still waits for the thread to exit.
+        """
         with self._cond:
             while self._q or self._busy:
+                if self._cancelled:
+                    return
                 self._cond.wait()
 
     def join(self, timeout: float | None = None):
@@ -111,7 +119,17 @@ class JobWriter:
                 self._files[idx] = {"tmp": tmp_path, "final": final_path,
                                     "fp": None, "on_closed": on_closed, "dead": True}
                 return
-            fp = open(tmp_path, "wb")
+            try:
+                fp = open(tmp_path, "wb")
+            except BaseException as exc:  # an open failure must not kill the writer thread
+                self._failed = self._failed or exc
+                self._files[idx] = {"tmp": tmp_path, "final": final_path,
+                                    "fp": None, "on_closed": on_closed, "dead": True}
+                self._events.emit("IO_OPEN_FAIL", self.job_id, path=tmp_path,
+                                  error=repr(exc),
+                                  total_reserved=self._arb.total_reserved,
+                                  budget=self._arb.budget)
+                return
             self._files[idx] = {"tmp": tmp_path, "final": final_path, "fp": fp,
                                 "on_closed": on_closed, "dead": False}
             self._events.emit("IO_OPEN", self.job_id, path=tmp_path,

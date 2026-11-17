@@ -1,0 +1,39 @@
+{
+  "budget_bytes": 18874368,
+  "total_reserved_now": 0,
+  "high_water_bytes": 18785387,
+  "kind_peaks": {
+    "buffer": 3145728,
+    "line": 16273223,
+    "key": 406868,
+    "io": 3145728,
+    "merge-read": 2886771,
+    "merge-key": 67284
+  },
+  "outstanding_reservations": 0,
+  "python_metadata_estimate_bytes": 15836314,
+  "peak_rss_bytes": 54337536,
+  "accounting_note": "B covers reserved byte content only (lines/keys/merge buffers/write buffers/in-flight I/O). Python object metadata is estimated separately; peak_rss_bytes is the kernel high-water mark (VmHWM).",
+  "elapsed_sec": 3.71,
+  "total_input_bytes": 86548995,
+  "input_over_budget": 4.59,
+  "events": 6033,
+  "reserve_waits": 0,
+  "reserve_fails": 0,
+  "admit_waits": 20,
+  "reclaim_rounds": 9,
+  "spills": 19,
+  "shorts_done_while_long_running": 8,
+  "verifications": {
+    "long0": true,
+    "long1": true,
+    "short0": true,
+    "short1": true,
+    "short2": true,
+    "short3": true,
+    "short4": true,
+    "short5": true,
+    "short6": true,
+    "short7": true
+  }
+}

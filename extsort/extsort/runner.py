@@ -3,12 +3,14 @@ from __future__ import annotations
 
 import os
 import threading
+import uuid
 
 from .arbiter import BufferArbiter, ConfigError
 from .events import EventLog
 from .ioengine import IOEngine
 from .job import JobConfig, SortJob
 from .interval import IntervalConfig, IntervalJoinJob
+from .resumable import ResumableConfig, ResumableSortJob
 
 
 class JobRunner:
@@ -79,6 +81,57 @@ class JobRunner:
         t.start()
         return jid
 
+    # ---------------------------------------------------------- resumable sort
+    def submit_resumable_sort(self, input_path: str, output_path: str,
+                              state_dir: str, *, job_id: str | None = None,
+                              **cfg_kwargs) -> str:
+        """Create a new resumable sort task and start its first attempt.
+
+        The state dir must not exist or be empty; it becomes the task's
+        private workspace (checkpoints, runs, lock).  Raises ConfigError /
+        ResumeError before creating anything when the placement, the config
+        or the lock is invalid.  The returned id is managed through the
+        usual status/cancel/wait API.
+        """
+        cfg = ResumableConfig(input_path, output_path, **cfg_kwargs)
+        task_id = job_id or f"rsort-{uuid.uuid4().hex[:12]}"
+        job = ResumableSortJob.create(self, cfg, state_dir, task_id)
+        return self._start_resumable(job, "create")
+
+    def resume_sort(self, state_dir: str, **overrides) -> str:
+        """Continue the task stored in ``state_dir`` in this process.
+
+        Never relies on objects/threads/reservations of any previous
+        process: the durable state in the state dir is the only input.
+        Tunables (read/write/merge sizes, fan-in, checkpoint threshold) may
+        differ from earlier attempts; the bound semantics (dedup,
+        max_line_bytes) may not.  All refusals raise before any mutation.
+        """
+        job = ResumableSortJob.resume(self, state_dir, overrides)
+        return self._start_resumable(job, "resume")
+
+    def _start_resumable(self, job: ResumableSortJob, how: str) -> str:
+        jid = job.job_id
+        with self._lock:
+            if jid in self._jobs:
+                job.abort_construction()
+                raise ValueError(f"duplicate job_id {jid}")
+        t = threading.Thread(target=job.run, name=f"rjob-{jid}", daemon=True)
+        with self._lock:
+            self._jobs[jid] = job
+            self._threads[jid] = t
+        self.events.emit("JOB_SUBMIT", jid, input=job.cfg.input_path,
+                         output=job.cfg.output_path, mws=job.mws,
+                         job_type="resumable-sort", how=how,
+                         state_dir=job.state_dir, task_id=job.task_id,
+                         attempt=job.attempt,
+                         dedup_key=job.cfg.dedup_key,
+                         max_line_bytes=job.cfg.max_line_bytes,
+                         total_reserved=self.arbiter.total_reserved,
+                         budget=self.arbiter.budget)
+        t.start()
+        return jid
+
     def status(self, job_id: str | None = None):
         with self._lock:
             if job_id is not None:
@@ -127,8 +180,11 @@ class JobRunner:
         with self._lock:
             jobs = list(self._jobs.values())
         for j in jobs:
-            if j.state not in ("DONE", "FAILED", "CANCELLED"):
-                j.cancel()
+            if j.state not in ("DONE", "FAILED", "CANCELLED", "ERROR"):
+                if isinstance(j, ResumableSortJob):
+                    j.suspend()   # graceful stop == controlled crash: resumable
+                else:
+                    j.cancel()
         for j in jobs:
             j.done_event.wait(30)
         self.events.close()

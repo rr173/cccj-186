@@ -51,6 +51,30 @@ def expected_output_bytes(input_path: str, dedup: bool) -> bytes:
     return b"".join(out)
 
 
+def expected_output_bytes_norm(input_path: str, dedup: bool) -> bytes:
+    """Reference for the resumable sorter: same stable codepoint sort and
+    dedup rule, but every delivered line is newline-terminated (a final
+    input line without '\\n' gets one wherever it lands in the output, so
+    adjacent records are never glued and the file always ends with '\\n')."""
+    with open(input_path, "rb") as f:
+        lines = [ln for ln in f.read().splitlines(keepends=True) if ln.strip()]
+    keyed = []
+    for i, ln in enumerate(lines):
+        obj = json.loads(ln)
+        keyed.append((obj["text"], i, ln))
+    keyed.sort(key=lambda t: t[0])
+    out = []
+    last = None
+    for key, _i, ln in keyed:
+        if dedup and key == last:
+            continue
+        last = key
+        if not ln.endswith(b"\n"):
+            ln = ln + b"\n"
+        out.append(ln)
+    return b"".join(out)
+
+
 def check_exact(input_path: str, output_path: str, dedup: bool) -> dict:
     exp = expected_output_bytes(input_path, dedup)
     with open(output_path, "rb") as f:

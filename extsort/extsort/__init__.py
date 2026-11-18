@@ -4,6 +4,8 @@ from .arbiter import (AllocFailed, BufferArbiter, Cancelled, ConfigError,  # noq
 from .job import JobConfig, JobFailed, SortJob  # noqa: F401
 from .interval import (IntervalConfig, IntervalInputError,  # noqa: F401
                        IntervalJoinJob)
+from .resumable import (PublishConflict, ResumableConfig, ResumableSortJob,  # noqa: F401
+                        ResumeError, ResumeRefused, StateCorrupt, StateLocked)
 from .runner import JobRunner  # noqa: F401
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -255,3 +255,143 @@ run，回调内绝不调用 reserve。
 生成的大数据与输出只落在临时/`artifacts` 目录，夹具与生成器在 `tests/` 内，
 不提交大文件。
 
+---
+
+# 可跨进程接续的排序任务（resumable sort）
+
+`extsort.resumable` 在同一套外排内核与同一个 `BufferArbiter` 之上提供带
+**持久进度**的 sort/dedup：进程被杀（含 SIGKILL）后，重新启动 Python、
+指定原任务的状态目录即可接着尚未做完的部分运行——不重读、不解析、不重排
+已确认前缀的原始内容，也不重跑已确认的归并组。排序语义与普通排序完全
+一致：`text` 非空、按 Unicode 码点升序、同键按原始物理行号稳定；dedup
+保留整份输入中该键最早的一行；保留行原始字节，末行无换行时交付前补一
+个换行（相邻记录不会被粘在一起）；空输入产生空输出；非法行/超长行使任
+务失败，绝不静默跳过。
+
+```python
+jid = runner.submit_resumable_sort("big.jsonl", "out/big.sorted",
+                                   "/srv/esx/state-big",
+                                   dedup_key=True, max_line_bytes=1<<18,
+                                   checkpoint_input_bytes=64<<20)
+runner.status(jid); runner.cancel(jid); runner.wait(jid)   # 同一套管理接口
+
+# 进程重启后（新进程、新 runner，预算和块/扇入可以不同）：
+jid2 = runner2.resume_sort("/srv/esx/state-big",
+                           read_block_bytes=1<<20, max_fan_in=8)
+```
+
+CLI（退出码 0=DONE 1=FAILED 3=拒绝 4=可恢复 I/O 错误 5=CANCELLED）：
+
+```bash
+python -m extsort rsort-new --input big.jsonl --output out/big.sorted \
+    --state-dir /srv/esx/state-big --budget 64MB --dedup \
+    --checkpoint-input-bytes 64MB
+python -m extsort rsort-status --state-dir /srv/esx/state-big [--verify-runs]
+python -m extsort rsort-resume --state-dir /srv/esx/state-big --budget 32MB \
+    --max-fan-in 8
+```
+
+## 状态目录（任务的私有工作区，崩溃后保留）
+
+```
+state_dir/
+  LOCK            flock(LOCK_EX|LOCK_NB) 持有文件；内核在持有者死亡时自动
+                  释放——不靠 PID 文件或超时推断存活。内容仅为诊断。
+  task.json       创建时写一次，之后只读：task_id、输入绑定（规范路径、
+                  dev/ino/size/mtime_ns/ctime_ns）、创建时观察到的目标文件
+                  身份（或不存在）、排序语义（dedup_key、max_line_bytes）。
+  progress.json   持久状态机：generation（每次检查点 +1）、phase
+                  (read/merge/publish/done)、read{confirmed_offset,
+                  next_lineno, eof}、确认 run 列表（名称/记录数/字节数/
+                  sha256）、run/merge 序号计数器、publish 记录、stopped
+                  终态标记、总量与按尝试的工作量统计。每次更新都是
+                  写 tmp → fsync(文件) → os.replace → fsync(目录)。
+  runs/           run-NNNNNN.run / merge-NNNNNN.run（.tmp→fsync→rename）。
+  events.jsonl    各尝试追加的事件日志（CLI 默认位置）。
+```
+
+新建要求状态目录不存在或为空（仅容忍 runner 自己的 events.jsonl）；
+state_dir 不得是输入/输出文件或其所在目录（创建时拒绝，清理因此永远碰
+不到输入或别的任务的状态）。同一目录同一时刻只能有一个写入者：第二个
+进程的新建/恢复立即以 `StateLocked` 拒绝。
+
+## 协议
+
+**读入检查点**：溢写 run 先落盘（tmp→fsync→rename），随后 `wait_idle`
++ fsync(runs/)，最后才把 `{confirmed_offset, next_lineno}` 与完整确认
+run 列表写进 progress.json——"读到这里"与"这些行已安全留在磁盘"严格分
+开：崩溃时未被检查点覆盖的溢写 run 是孤儿，恢复时删除、对应尾段重读
+（重读量 ≤ 一个检查点间隔 + 一个读块 + 一条行）。`checkpoint_input_bytes`
+可配：未确认前缀超过阈值后，至多再读完一条合法行就同步发起检查点，落
+盘确认前不再读新数据；绝不会等整份输入读完才第一次保存。恢复时用
+`seek(confirmed_offset)` 打开来源，已确认前缀不再读取（事件
+`RSORT_SOURCE_OPEN/RSORT_SOURCE_BLOCK` 记录每次真实打开/读取的范围，
+测试据此逐断言）。
+
+**归并接续**：确定式队列计划——每次取队首 `max_fan_in` 个确认 run 归并
+为 `merge-NNNNNN.run`，fsync 后先持久化新 run 列表（输入移除、输出追
+加、generation+1），再回收被替代的输入文件。崩溃点在持久化之前→孤儿
+输出删除、该组重做；在持久化之后、回收之前→旧输入作为孤儿删除，组不
+重跑。已确认组永不重跑；未做完的单个组与未完成的最终输出允许重做
+（重做边界：每次崩溃至多 1 个未确认组 + 1 趟最终输出）。最终字节与
+run 切分/恢复次数无关（堆序 (key, lineno) 的全序归并 + dedup 取最早行
+都是分组无关的）。
+
+**发布**：最终归并写 `<output>.tmp.<task_id>.part` → rename 为
+`<output>.tmp.<task_id>`（fsync）→ 持久化 phase=publish（含暂存文件
+的字节数与 sha256）→ 重新核对目标仍与创建时观察一致 → 一次
+`os.replace` 原子替换 → fsync(父目录) → 持久化 phase=done。恢复时：
+目标已持有本任务结果（哈希一致）→ 只补记 done（"已替换未记录"窗口）；
+目标仍是当初观察的旧文件且暂存完好 → 重新 rename；暂存损坏 → 重做最
+终归并；目标是别的内容 → `PublishConflict`，保留现场、不覆盖、不认
+成功。DONE 任务的恢复同样核验目标：仍在则幂等返回（不重读输入、不重
+做归并），缺失或被更换则报告问题且不改写持久终态。
+
+**终态**：`cancel` 是明确放弃——持久化 `stopped=cancelled` 后恢复只回
+显终态，绝不复活或发布；数据错误持久化 `stopped=failed`（不可恢复）；
+暂时的磁盘 OSError 持久化 `stopped=io_error`（可恢复），故障解除后从
+最后已确认边界接续；崩溃不留 stopped 标记，因此天然可恢复。收束时先
+`writer.join()` 等在途 I/O，再写终态，不留能改状态的后台线程。run 内
+容/长度或持久状态损坏 → 明确拒绝（`StateCorrupt`/`ResumeRefused`），
+不删除证据、不默默重算。恢复时校验全部确认 run 的 sha256（允许——这
+不是重读原始输入）；输入被替换（即使字节一样）、追加、截断或元数据变
+化，或要求更改 dedup/单行上限 → 在写任何任务数据、删除 run 或碰输出
+之前拒绝。恢复可用不同预算与块/扇入，只要 MWS ≤ 新预算；不合规配置在
+消耗或破坏任何进度之前拒绝。
+
+**保留与回收**：DONE/CANCELLED 自动删除 runs/ 与暂存输出（状态目录只
+剩 LOCK/task.json/progress.json/events.jsonl 这份持久记录）；FAILED 保
+留 runs 供诊断；ERROR（可恢复）保留全部以待接续。不再需要任务时，整
+个 state_dir 可由运维手动删除——清理只发生在 state_dir 内部与
+`<output>.tmp.<task_id>*`，永远不会碰输入或别的任务。
+
+## 内存与可观察性
+
+run 读写走与普通排序相同的预留缓冲池/写线程（buffer/io 类），归并读
+用 `RunReader`（merge-read/merge-key），状态编码与校验和核验使用一个
+64KB 的常驻 `state` 类预留（MWS 因此为普通排序公式 + 2×64KB）；检查点
+只移动文件名与偏移，绝不把整份输入或所有 run 装进内存。内存中的
+reservation 不持久化，下一进程从磁盘状态重建。`status()` 暴露：检查点
+代次、confirmed_offset/next_lineno、确认 run 数、本次尝试真实来源读
+取字节与归并工作量、复用 run 数、attempt/recoveries、终态；事件日志
+（`RSORT_*`）给出每次尝试的来源读取范围、实际执行的归并组、检查点、
+发布与孤儿清理，统计不掩盖重做的工作。任务结束后本次额度归零（所有
+测试断言 `total_reserved == 0`、`DOUBLE_RELEASE == 0`）。
+
+## 测试（`tests/test_resumable.py`、`tests/test_resume_kill.py`）
+
+进程内：字节级参考对照（sort/dedup）、无换行末行、空输入、检查点节奏、
+可恢复 I/O 错误换预算恢复、持久取消、shutdown 挂起后可恢复、run 截断/
+改字节拒绝、progress 损坏拒绝、输入替换/追加/截断/touch 拒绝、语义变更
+拒绝、双 runner 锁互斥、与普通排序共享仲裁器、DONE 幂等/目标被动、发
+布前冲突、后段坏行、超长行。
+
+独立子进程（真实 SIGKILL 闸门）：run 写好未确认、归并已确认未回收、目
+标已替换 DONE 未记录三个精确闸门；输入处理一部分后杀掉换预算恢复；多
+轮恢复穿过多趟归并（热键跨检查点，与未中断对照运行逐字节一致、确认组
+序列一致、重做量 ≤ 崩溃次数）；真实第二进程互斥与杀死后接管；发布窗
+口外部替换目标；真实 I/O 失败后恢复；取消后重开；大样本运行时生成、
+流式校验、按尝试独立记录来源读取范围与归并组执行（证据落盘
+`artifacts/rsort-kill-*/`）。
+
+

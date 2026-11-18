@@ -17,6 +17,7 @@ class EventLog:
         self._seq = 0
         self._events: list[dict] = []
         self._keep = keep_in_memory
+        self.path = path
         self._fp = open(path, "a", buffering=1, encoding="utf-8") if path else None
         self._t0 = time.monotonic()
 

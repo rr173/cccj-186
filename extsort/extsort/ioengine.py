@@ -45,11 +45,12 @@ class JobWriter:
         self._thread.start()
 
     # ------------------------------------------------------------------ API
-    def open_file(self, tmp_path: str, final_path: str, on_closed) -> int:
+    def open_file(self, tmp_path: str, final_path: str, on_closed,
+                  fsync: bool | None = None) -> int:
         with self._cond:
             idx = self._next_idx
             self._next_idx += 1
-            self._q.append(("open", idx, tmp_path, final_path, on_closed))
+            self._q.append(("open", idx, tmp_path, final_path, on_closed, fsync))
             self._cond.notify_all()
             return idx
 
@@ -114,24 +115,27 @@ class JobWriter:
     def _process(self, item):
         op = item[0]
         if op == "open":
-            _, idx, tmp_path, final_path, on_closed = item
+            _, idx, tmp_path, final_path, on_closed, fsync = item
             if self._cancelled or self._failed is not None:
                 self._files[idx] = {"tmp": tmp_path, "final": final_path,
-                                    "fp": None, "on_closed": on_closed, "dead": True}
+                                    "fp": None, "on_closed": on_closed,
+                                    "fsync": fsync, "dead": True}
                 return
             try:
                 fp = open(tmp_path, "wb")
             except BaseException as exc:  # an open failure must not kill the writer thread
                 self._failed = self._failed or exc
                 self._files[idx] = {"tmp": tmp_path, "final": final_path,
-                                    "fp": None, "on_closed": on_closed, "dead": True}
+                                    "fp": None, "on_closed": on_closed,
+                                    "fsync": fsync, "dead": True}
                 self._events.emit("IO_OPEN_FAIL", self.job_id, path=tmp_path,
                                   error=repr(exc),
                                   total_reserved=self._arb.total_reserved,
                                   budget=self._arb.budget)
                 return
             self._files[idx] = {"tmp": tmp_path, "final": final_path, "fp": fp,
-                                "on_closed": on_closed, "dead": False}
+                                "on_closed": on_closed, "fsync": fsync,
+                                "dead": False}
             self._events.emit("IO_OPEN", self.job_id, path=tmp_path,
                               total_reserved=self._arb.total_reserved, budget=self._arb.budget)
             return
@@ -177,7 +181,7 @@ class JobWriter:
             try:
                 if f["fp"] is not None and not f["dead"] and not self._cancelled and err is None:
                     f["fp"].flush()
-                    if self.engine.fsync:
+                    if self.engine.fsync or f.get("fsync"):
                         os.fsync(f["fp"].fileno())
                     f["fp"].close()
                     os.replace(f["tmp"], f["final"])  # atomic publish

@@ -6,7 +6,8 @@ for t in test_barrier_reclaim test_cancel_paths test_io_failure test_edges test_
          test_interval_correctness test_interval_validation \
          test_interval_lifecycle test_interval_scale \
          test_resumable test_resume_kill \
-         test_gq_correctness test_gq_validation test_gq_lifecycle test_gq_scale; do
+         test_gq_correctness test_gq_validation test_gq_lifecycle test_gq_scale \
+         test_repartition_correctness test_repartition_lifecycle test_repartition_scale; do
     echo "=== $t ==="
     timeout 600 python3 "tests/$t.py"
 done

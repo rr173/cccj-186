@@ -102,6 +102,14 @@ class BufferPool:
                 self._cond.wait()   # woken by buffer_returned() or job.cancel()
             return self._free.pop()
 
+    def try_acquire(self):
+        """Pop a free buffer without blocking, or None (caller may then
+        reserve a fresh one within its envelope)."""
+        with self._cond:
+            if not self._free:
+                return None
+            return self._free.pop()
+
     def buffer_returned(self, res: Reservation):
         # called by the writer thread after the I/O completed (the arbiter has
         # already transferred the reservation back to kind "buffer")

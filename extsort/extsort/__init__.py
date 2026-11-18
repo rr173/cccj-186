@@ -8,6 +8,9 @@ from .quantiles import (GroupQuantileJob, QuantileConfig,  # noqa: F401
                         QuantileInputError, decimal_order_key)
 from .resumable import (PublishConflict, ResumableConfig, ResumableSortJob,  # noqa: F401
                         ResumeError, ResumeRefused, StateCorrupt, StateLocked)
+from .repartition import (FORMAT_VERSION, RepartitionConfig,  # noqa: F401
+                         RepartitionInputError, RepartitionJob, resolve_pointer,
+                         route_partition, validate_pointer)
 from .runner import JobRunner  # noqa: F401
 
 __version__ = "0.3.0"

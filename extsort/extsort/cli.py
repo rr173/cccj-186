@@ -118,6 +118,23 @@ def main(argv=None) -> int:
     gq.add_argument("--fsync", action="store_true")
     gq.add_argument("--event-log", default=None)
 
+    rp = sub.add_parser("repartition",
+                        help="route JSONL records into fixed shards (no sort/dedup)")
+    rp.add_argument("--input", required=True, help="unsorted UTF-8 JSONL")
+    rp.add_argument("--outdir", required=True,
+                    help="dataset dir: generations/<id>/ + CURRENT")
+    rp.add_argument("--key-pointer", required=True,
+                    help="RFC 6901 JSON Pointer to a string field")
+    rp.add_argument("--partitions", required=True, type=int)
+    rp.add_argument("--max-open-shards", type=int, default=None)
+    rp.add_argument("--budget", required=True, type=_size)
+    rp.add_argument("--workdir", required=True)
+    rp.add_argument("--max-line-bytes", type=_size, default=256 * 1024)
+    rp.add_argument("--read-block", type=_size, default=256 * 1024)
+    rp.add_argument("--write-buf", type=_size, default=512 * 1024)
+    rp.add_argument("--fsync", action="store_true")
+    rp.add_argument("--event-log", default=None)
+
     args = ap.parse_args(argv)
 
     if args.cmd == "run":
@@ -205,6 +222,37 @@ def main(argv=None) -> int:
             print("REPORT " + json.dumps(rep, ensure_ascii=False, indent=2))
             return {"DONE": 0, "FAILED": 1, "ERROR": 4, "CANCELLED": 5}.get(
                 st["state"], 1)
+        finally:
+            runner.shutdown()
+
+    if args.cmd == "repartition":
+        runner = JobRunner(args.budget, args.workdir,
+                           event_log_path=args.event_log, fsync=args.fsync)
+        try:
+            kwargs = dict(max_line_bytes=args.max_line_bytes,
+                          read_block_bytes=args.read_block,
+                          write_buf_bytes=args.write_buf)
+            if args.max_open_shards is not None:
+                kwargs["max_open_shards"] = args.max_open_shards
+            try:
+                jid = runner.submit_repartition(
+                    args.input, args.outdir, args.key_pointer,
+                    args.partitions, **kwargs)
+            except ConfigError as exc:
+                print(f"REJECTED {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 3
+            print(f"submitted {jid}: {args.input} -> {args.outdir} "
+                  f"pointer={args.key_pointer!r} partitions={args.partitions}")
+            st = runner.wait(jid)
+            print(json.dumps(st, ensure_ascii=False))
+            rep = runner.report()
+            rep.pop("jobs", None)
+            print("REPORT " + json.dumps(rep, ensure_ascii=False, indent=2))
+            if st["state"] == "DONE":
+                current = os.path.join(args.outdir, "CURRENT")
+                gen_id = open(current, encoding="utf-8").read().strip()
+                print(f"PUBLISHED {current} -> {gen_id}")
+            return {"DONE": 0, "FAILED": 1, "CANCELLED": 5}.get(st["state"], 1)
         finally:
             runner.shutdown()
 

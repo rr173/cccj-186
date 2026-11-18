@@ -476,4 +476,104 @@ reservation 不持久化，下一进程从磁盘状态重建。`status()` 暴露
 流式校验、按尝试独立记录来源读取范围与归并组执行（证据落盘
 `artifacts/rsort-kill-*/`）。
 
+---
+
+# 外存分区作业（repartition）
+
+`extsort.repartition.RepartitionJob` 在同一个 `BufferArbiter` 之上把未排序
+JSONL **逐条路由**到固定分片：不排序、不去重、不聚合，同一分片内严格保持
+记录的输入先后，原始记录字节（含已有行结束符）逐字节保留；仅当输入末行
+没有换行时补一个 LF，避免与后续记录粘连。提交入口与其它作业共用一个
+runner：
+
+```python
+jid = runner.submit_repartition("in.jsonl", "/srv/dataset",
+                                key_pointer="/user/id", num_partitions=64,
+                                max_open_shards=8)
+runner.status(jid)      # 同一套 status/cancel/wait
+runner.cancel(jid); runner.wait(jid)
+```
+
+CLI：
+
+```bash
+python -m extsort repartition --input in.jsonl --outdir /srv/dataset \
+    --key-pointer /user/id --partitions 64 --max-open-shards 8 \
+    --budget 64MB --workdir ./work
+```
+
+## 输入合同
+
+每行必须是一个 JSON 对象（UTF-8 JSONL）。调用者给一个 RFC 6901 JSON
+Pointer，它必须解析到对象属性或数组有效下标，最终值必须是字符串（允许
+空字符串）。缺失路径、类型不符（解析结果不是 string）、空行、非法 JSON、
+非标准数值常量（NaN/Infinity/-Infinity）、超过 `max_line_bytes` 的记录都
+让整项作业失败，错误给出从 1 开始的**物理行号与原因**（`RepartitionInputError`），
+绝不跳过坏行或发布半成品。分区数是 1..4096 的整数。
+
+## 固定映射（与运行时状态无关）
+
+```
+shard = uint64_be( sha256( key 的 UTF-8 字节 ).digest()[:8] ) mod N
+```
+
+相同键永远落在同一分片；映射只依赖键字节与 N，不依赖 Python 进程哈希
+随机化或任何运行时状态，跨进程重复运行结果一致。
+
+## 数据集目录、清单与原子发布
+
+每次执行写一个全新的唯一目录，旧 generation 永不删除：
+
+```
+<outdir>/
+  CURRENT                         # UTF-8 小文件，内容是当前完整 generation_id
+  generations/<generation_id>/
+    manifest.json
+    part-00000.jsonl ... part-(N-1).jsonl   # 空分片也是零字节文件
+```
+
+`manifest.json` 记录格式版本、键指针、分区算法（sha256 / 前 8 字节 /
+无符号大端 / 取模及模数）、分区数、总记录数、输入 SHA-256，以及每个分片的
+记录数、字节数和 SHA-256。先把所有分片与清单完整落盘并关闭，再用
+**同目录临时文件 + `os.replace` 原子替换 CURRENT**——这唯一的替换就是提交
+边界：边界之前的任何校验失败、取消或磁盘错误都不改变已有 CURRENT 及其
+指向的数据，只清理本作业新建的临时 generation（含 runner 工作目录里的
+spill 暂存）；边界之后到达的取消仍报告成功。读取方只通过 CURRENT 定位
+当前完整数据集。
+
+## 有界文件描述符与缓冲（不随分区数膨胀）
+
+调用者用 `max_open_shards`（1..N）限制同时打开的分片数据文件数，实际
+打开数绝不超过它。实现是有界 LRU 分片缓存 + 有序临时片段：
+
+- 同时打开的分片文件与驻留分片写缓冲都不超过 `max_open_shards`；缓存满
+  时把最久未用分片的脏缓冲刷到一个**共享追加型 spill 文件**（记录该分片
+  的 `(offset, length)` 时间序片段）并关闭文件描述符，缓冲进入有界空闲池
+  循环复用，热路径没有 rename，也不为每个分片永久保留 fd 或无界缓冲。
+- 路由结束后，每个分片按其时间序片段从 spill 文件顺序合并出最终 part，
+  因此分片被反复开关也不改变记录顺序；合并读块同样先预留后读取。
+- 所有驻留字节（输入块 `line`、键 `key`、分片写缓冲 `buffer`、同步在途
+  I/O `io`、合并读 `merge-read`）都走同一个 `BufferArbiter` 的 B，复制前
+  先预留；阻塞式预留只在路由锁之外进行，协作回收回调在锁内只做
+  flush/释放、绝不调用 reserve，因此与等待额度的工作线程之间无死锁。
+  MWS 在提交时计算（含 `max_open_shards` 个写缓冲槽），装不下最小工作集
+  的配置在启动时即以 `ConfigError` 拒绝。
+
+## 阶段与可观察性
+
+`status().phase` 依次为 `read -> route -> merge -> manifest -> publish`，
+并暴露输入行数、已路由记录数、输入/分片写字节、分片打开高水位、驱逐次数、
+冲刷次数、片段合并次数、当前/峰值预留、MWS、generation 与提交标志；
+`report()` 给出各 kind 峰值、预算高水位、VmHWM 真实峰值 RSS 与 Python
+元数据估算。与排序、时间范围关联、可恢复排序、分位作业共用运行器时，各
+作业独立准入、互不污染，失败只清理本作业并归还全部预留。
+
+## 测试
+
+| 测试 | 内容 |
+|------|------|
+| `test_repartition_correctness.py` | 独立指针解析与 SHA-256 路由参考（`rp_ref.py`，不 import 产品代码）：嵌套对象/数组路径、Pointer 转义、空键、相同键、空分片、无换行末行、多种缓冲/打开数几何逐字节一致；同输入重复运行及跨 `python -I` 子进程的分片归属一致；N=1 时输出与输入逐字节相同 |
+| `test_repartition_lifecycle.py` | 全部合同违约（物理行号+原因）、超长行、提交期配置/MWS 拒绝；路由中/提交边界前后的取消语义；分片写失败、清单失败、后段坏行均与预置旧 CURRENT/旧分片逐字节比较；外线程回收回调无死锁且真释放额度；阶段与计数可观察、预算归零；兄弟作业失败隔离 |
+| `test_repartition_scale.py` | 运行时造数，记录交错分布到大量分区；真实降低 `RLIMIT_NOFILE` 且 `max_open_shards=3` 下无漏行/重复/乱序，逐事件核对共享预留 ≤ B；紧预算协作回收、与普通排序并发完成且额度归零；多种小缓冲几何输出一致。大数据与暂存只在运行时生成于临时目录，不提交 Git |
+
 

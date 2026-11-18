@@ -11,6 +11,7 @@ from .ioengine import IOEngine
 from .job import JobConfig, SortJob
 from .interval import IntervalConfig, IntervalJoinJob
 from .quantiles import GroupQuantileJob, QuantileConfig
+from .repartition import RepartitionConfig, RepartitionJob
 from .resumable import ResumableConfig, ResumableSortJob
 
 
@@ -109,6 +110,43 @@ class JobRunner:
         self.events.emit("JOB_SUBMIT", jid, input=input_path, output=output_path,
                          mws=job.mws, job_type="group-quantiles",
                          percentiles_bp=list(cfg.percentiles_bp),
+                         max_line_bytes=cfg.max_line_bytes,
+                         total_reserved=self.arbiter.total_reserved,
+                         budget=self.arbiter.budget)
+        t.start()
+        return jid
+
+    # ------------------------------------------------------------ repartition
+    def submit_repartition(self, input_path: str, output_dir: str,
+                           key_pointer: str, num_partitions: int, *,
+                           job_id: str | None = None, **cfg_kwargs) -> str:
+        """Submit one external repartition job.
+
+        Records are routed (never sorted/deduped/aggregated) into
+        ``num_partitions`` fixed shards under a fresh generation of
+        ``output_dir``; publication is one atomic ``CURRENT`` replace.  The
+        returned id is managed through the same status/cancel/wait API and
+        shares this runner's BufferArbiter.  ConfigError is raised at submit
+        time when the configuration's minimal working set cannot fit, or the
+        pointer/partition/open-shard configuration is invalid.
+        """
+        with self._lock:
+            self._seq += 1
+            jid = job_id or f"job{self._seq}"
+            if jid in self._jobs:
+                raise ValueError(f"duplicate job_id {jid}")
+        cfg = RepartitionConfig(input_path, output_dir, key_pointer,
+                                num_partitions, **cfg_kwargs)
+        job = RepartitionJob(self, jid, cfg)   # MWS check: ConfigError at submit
+        t = threading.Thread(target=job.run, name=f"rpart-{jid}", daemon=True)
+        with self._lock:
+            self._jobs[jid] = job
+            self._threads[jid] = t
+        self.events.emit("JOB_SUBMIT", jid, input=input_path, output_dir=output_dir,
+                         mws=job.mws, job_type="repartition",
+                         key_pointer=cfg.key_pointer,
+                         num_partitions=cfg.num_partitions,
+                         max_open_shards=cfg.max_open_shards,
                          max_line_bytes=cfg.max_line_bytes,
                          total_reserved=self.arbiter.total_reserved,
                          budget=self.arbiter.budget)

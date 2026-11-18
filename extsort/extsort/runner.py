@@ -10,6 +10,7 @@ from .events import EventLog
 from .ioengine import IOEngine
 from .job import JobConfig, SortJob
 from .interval import IntervalConfig, IntervalJoinJob
+from .quantiles import GroupQuantileJob, QuantileConfig
 from .resumable import ResumableConfig, ResumableSortJob
 
 
@@ -75,6 +76,39 @@ class JobRunner:
             self._threads[jid] = t
         self.events.emit("JOB_SUBMIT", jid, left=left_path, right=right_path,
                          output=output_path, mws=job.mws, job_type="interval-join",
+                         max_line_bytes=cfg.max_line_bytes,
+                         total_reserved=self.arbiter.total_reserved,
+                         budget=self.arbiter.budget)
+        t.start()
+        return jid
+
+    # ----------------------------------------------------- group quantiles
+    def submit_group_quantiles(self, input_path: str, output_path: str,
+                               percentiles_bp, *, job_id: str | None = None,
+                               **cfg_kwargs) -> str:
+        """Submit one group-quantile job.
+
+        All requested basis points share the single parse + external-organise
+        pass: the input is read and externally sorted once, then nearest-rank
+        thresholds are extracted per ``text`` group.  The returned id is
+        managed through the same status/cancel/wait API and shares this
+        runner's BufferArbiter.  ConfigError is raised at submit time when the
+        configuration's minimal working set cannot fit the budget.
+        """
+        with self._lock:
+            self._seq += 1
+            jid = job_id or f"job{self._seq}"
+            if jid in self._jobs:
+                raise ValueError(f"duplicate job_id {jid}")
+        cfg = QuantileConfig(input_path, output_path, percentiles_bp, **cfg_kwargs)
+        job = GroupQuantileJob(self, jid, cfg)   # MWS check: ConfigError at submit
+        t = threading.Thread(target=job.run, name=f"gqjob-{jid}", daemon=True)
+        with self._lock:
+            self._jobs[jid] = job
+            self._threads[jid] = t
+        self.events.emit("JOB_SUBMIT", jid, input=input_path, output=output_path,
+                         mws=job.mws, job_type="group-quantiles",
+                         percentiles_bp=list(cfg.percentiles_bp),
                          max_line_bytes=cfg.max_line_bytes,
                          total_reserved=self.arbiter.total_reserved,
                          budget=self.arbiter.budget)

@@ -257,6 +257,88 @@ run，回调内绝不调用 reserve。
 
 ---
 
+# 分组精确分位阈值（group-quantiles）
+
+`extsort.quantiles.GroupQuantileJob` 在同一套外排内核与同一个
+`BufferArbiter` 之上，从**未排序**的测量 JSONL 直接给出每个 `text` 组的
+多个**精确** nearest-rank 分位阈值及其来源物理行——产出是阈值结果，而不是
+一份重新排序的全量明细。提交入口与普通排序共用一个 runner：
+
+```python
+jid = runner.submit_group_quantiles("meas.jsonl", "out/quant.jsonl",
+                                    [0, 2500, 5000, 10000])   # bp: 0..10000
+runner.status(jid)      # 同一套 status/cancel/wait
+runner.cancel(jid); runner.wait(jid)
+```
+
+CLI：
+
+```bash
+python -m extsort.cli group-quantiles --input meas.jsonl -o quant.jsonl \
+    --bp 0,2500,5000,10000 --budget 64MB --workdir ./work
+```
+
+## 精确十进制语义（禁止 binary float）
+
+`value` 按 JSON 十进制数值精确比较，整数与小数一视同仁，**全程不转
+binary float**：JSON 解码用 parse hook 保留原始数字词法（lexeme），纯字符串
+运算把词法规范化成"字节序即数值序"的定长前缀顺序键
+（`decimal_order_key`：符号类 neg<zero<pos、2 字节偏置十进制幂 lead、
+终止符感知的有效数字串，负数整体反向）。`1`、`1.0`、`1e0` 同值同键；超过
+binary-float 精度的相邻整数仍可区分；极小/极大指数（受行宽约束）精确可比。
+原始拼写逐字节保留为结果里的 `value_token`。`bool/null/字符串/NaN/Infinity/
+缺字段/空行/非法 JSON/超 max_line_bytes` 都让整项作业失败，错误给出从 1
+开始的**物理行号与原因**，绝不跳过坏行。
+
+## 排名与输出合同
+
+每组 n 条有效记录，对每个请求基点 `bp`（一次作业内互不重复的整数，
+0..10000，10000=100%）按 nearest-rank 计算
+`r = max(1, ceil(bp*n/10000))`，排名从 1 开始；`bp=0` 取最小值。目标排名
+落在重复数值上时，来源取该**数值运行（equal-value run）中物理行号最小**的
+记录及其原始拼写。输出每行一个 JSON 对象，字段
+`text,bp,n,rank,source_line,value_token`，按 text 的 Unicode 码点序、再按
+bp 数值序排列；空输入产生空结果。因此改变读块、run 容量、归并扇入都不改变
+输出字节。
+
+## 一次整理、多 bp 共用；热点组与海量组都不驻留
+
+阶段（各自在 MWS 包络内准入，`status().phase` 可观察
+`parse -> merge -> extract -> publish`）：
+
+1. **parse（解析/溢写）**：逐块校验、先预留后复制，按
+   `(text, 数值顺序键, 物理行号)` 溢写排序 run。所有 bp 共用这**一次**输入
+   解析与外排，bp 数量不改变溢写/归并工作量。
+2. **merge（归并）**：超扇入时多趟 k-way 归并；末趟在同一次扫描里写出全局
+   有序 run 和一份流式的分组索引 `(key, n)`——任何时刻都不保留整组数值，也
+   不保留全量分组计数表。单一热点组可以远大于 B，组数量也可以远大于 B。
+3. **extract（排名提取）**：按索引逐组流式扫描有序 run，只暂存命中目标排名
+   的等值运行（每组至多一个等值运行的 token 驻留），内存与组大小无关。
+4. **publish（发布）**：渲染 JSONL 到 `output.tmp.<jid>`，`os.replace`
+   原子替换；解析/归并/写盘失败或取消时不发布前缀，保留原目标、输入与其他
+   作业文件，只清理本作业临时目录并归还全部预留。
+
+数值解析表示、排序 run、归并读写、结果缓冲与在途 I/O 字节全部登记在
+**同一个 BufferArbiter 的 B 口径**（新增 kind `value`/`vkey`，复用
+`line/key/merge-read/merge-key/buffer/io`）；复制前先预留，任意时刻总预留
+≤ B，Python 固定元数据与真实峰值 RSS（VmHWM）分开报告。所有内部预留挂在
+同一个作业 id 下，包络外请求 fail-fast 回退为自我溢写，内部阶段不会等待
+自己占住的额度而死锁；协作回收回调只溢写 parse 阶段已预留的 run，回调内
+绝不调用 reserve。本功能**不增加**崩溃后恢复协议。
+
+## 测试
+
+| 测试 | 内容 |
+|------|------|
+| `test_gq_correctness.py` | 独立 `Fraction` 参考计算器（`gq_ref.py`，不 import 任何产品解析/比较/排序代码）：负数、整数小数混写、超 float 精度相邻整数、极小/极大指数、等值异写、重复值、Unicode text、bp=0/10000、多 bp 同排名、空输入；4 种读块/run/扇入几何输出逐字节一致；来源行与完整顺序核对 |
+| `test_gq_validation.py`  | bool/null/字符串值、NaN/Infinity、缺字段、空 text、空行、非法 JSON、超长行、后段非法值；物理行号错误、无半成品、旧目标字节不变、兄弟作业与仲裁器不受影响 |
+| `test_gq_lifecycle.py`   | parse/extract/准入等待三处可控取消、真实注入写失败（旧目标不变）、与普通排序并发完成、阶段与计数/预算可观察性、额度归零 |
+| `test_gq_scale.py`       | 运行时造数：大于 B 的单一热点组、8000 个小组多趟归并；逐事件重放预留不越界、流式核对已知排名/来源/行数、证明多 bp 共用一次整理、RSS 与预算分别记录 |
+
+大数据、临时 run 与输出只在运行时生成于临时目录，不提交到 Git。
+
+---
+
 # 可跨进程接续的排序任务（resumable sort）
 
 `extsort.resumable` 在同一套外排内核与同一个 `BufferArbiter` 之上提供带

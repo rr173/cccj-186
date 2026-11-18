@@ -101,6 +101,23 @@ def main(argv=None) -> int:
     rstat.add_argument("--verify-runs", action="store_true",
                        help="re-hash every confirmed run and compare")
 
+    gq = sub.add_parser("group-quantiles",
+                        help="exact nearest-rank quantile thresholds per text group")
+    gq.add_argument("--input", required=True, help="unsorted JSONL (text, value)")
+    gq.add_argument("-o", "--output", required=True)
+    gq.add_argument("--bp", required=True,
+                    help="comma-separated integer basis points 0..10000, e.g. 0,2500,5000,10000")
+    gq.add_argument("--budget", required=True, type=_size)
+    gq.add_argument("--workdir", required=True)
+    gq.add_argument("--max-line-bytes", type=_size, default=256 * 1024)
+    gq.add_argument("--read-block", type=_size, default=256 * 1024)
+    gq.add_argument("--write-buf", type=_size, default=512 * 1024)
+    gq.add_argument("--merge-chunk", type=_size, default=256 * 1024)
+    gq.add_argument("--max-fan-in", type=int, default=16)
+    gq.add_argument("--run-record-capacity", type=int, default=0)
+    gq.add_argument("--fsync", action="store_true")
+    gq.add_argument("--event-log", default=None)
+
     args = ap.parse_args(argv)
 
     if args.cmd == "run":
@@ -156,6 +173,38 @@ def main(argv=None) -> int:
             rep.pop("jobs", None)
             print("REPORT " + json.dumps(rep, ensure_ascii=False, indent=2))
             return 0 if st["state"] == "DONE" else 1
+        finally:
+            runner.shutdown()
+
+    if args.cmd == "group-quantiles":
+        try:
+            bps = [int(x) for x in args.bp.split(",") if x != ""]
+        except ValueError:
+            print("REFUSED: --bp must be comma-separated integers", file=sys.stderr)
+            return 3
+        runner = JobRunner(args.budget, args.workdir,
+                           event_log_path=args.event_log, fsync=args.fsync)
+        try:
+            try:
+                jid = runner.submit_group_quantiles(
+                    args.input, args.output, bps,
+                    max_line_bytes=args.max_line_bytes,
+                    read_block_bytes=args.read_block,
+                    write_buf_bytes=args.write_buf,
+                    merge_chunk_bytes=args.merge_chunk,
+                    max_fan_in=args.max_fan_in,
+                    run_record_capacity=args.run_record_capacity)
+            except ConfigError as exc:
+                print(f"REJECTED {type(exc).__name__}: {exc}", file=sys.stderr)
+                return 3
+            print(f"submitted {jid}: {args.input} -> {args.output} bp={bps}")
+            st = runner.wait(jid)
+            print(json.dumps(st, ensure_ascii=False))
+            rep = runner.report()
+            rep.pop("jobs", None)
+            print("REPORT " + json.dumps(rep, ensure_ascii=False, indent=2))
+            return {"DONE": 0, "FAILED": 1, "ERROR": 4, "CANCELLED": 5}.get(
+                st["state"], 1)
         finally:
             runner.shutdown()
 
